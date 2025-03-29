@@ -1,0 +1,14 @@
+{
+  "dependencies": {
+    "@turf/turf": "^7.2.0",
+    "axios": "^1.8.1",
+    "csv-parser": "^3.2.0",
+    "firebase-admin": "^13.1.0",
+    "h3-js": "^4.1.0",
+    "ogr2ogr": "^5.1.0",
+    "papaparse": "^5.5.2",
+    "shapefile": "^0.6.6",
+    "shpjs": "^4.0.4",
+    "unzipper": "^0.12.3"
+  }
+}
