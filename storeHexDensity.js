@@ -1,7 +1,7 @@
 //storeHexDensity.js
 const cluster = require('cluster');
 const numFips = 57;
-const resolutions = [5,6,7];
+const resolutions = [5,6,7, 8 ,9];
 const totalCpus = 180;
 let cpuIndex = 0;
 
