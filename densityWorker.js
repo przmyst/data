@@ -144,7 +144,7 @@ async function processFips(fips) {
 
     // === 4. Pre-filter Setup: Compute Hexagon Circumradius and Buffered Bounding Boxes for Tracts ===
     // Use the hexagon's edge length as the circumradius (distance from center to vertex)
-    const hexEdgeLength = h3.edgeLength(resolution, 'm'); // in meters
+    const hexEdgeLength = h3.getHexagonEdgeLengthAvg(resolution, 'm'); // in meters
     const hexCircumradius = hexEdgeLength; // for a regular hexagon, this is a safe expansion distance
 
     // For each tract, compute its bounding box and buffer it by the hexCircumradius.
@@ -172,7 +172,7 @@ async function processFips(fips) {
             tractBuffers.forEach(({ tract, bufferedBbox }) => {
                 if (turf.booleanPointInPolygon(hexCentroid, bufferedBbox)) {
                     // Only perform the expensive intersection if the centroid is inside the buffered box.
-                    const intersection = turf.intersect(hexPolygon, tract);
+                    const intersection = turf.intersect(turf.featureCollection([hexPolygon, tract]));
                     if (intersection) {
                         const intersectionArea = turf.area(intersection);
                         const estimatedPopulation = (intersectionArea / 1e6) * tract.properties.DENSITY;
