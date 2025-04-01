@@ -1,4 +1,4 @@
-//densityWorker.js
+// densityWorker.js
 const fs = require('fs');
 const fsPromises = require('fs').promises;
 const path = require('path');
@@ -13,7 +13,7 @@ const { execSync } = require('child_process');
 // --- Pin this worker to a single CPU ---
 const cpuIndex = process.env.CPU ? parseInt(process.env.CPU) : 0;
 try {
-    // The taskset command binds the current process (process.pid) to the specified CPU.
+    // Bind the current process to the specified CPU.
     execSync(`taskset -p -c ${cpuIndex} ${process.pid}`);
     console.log(`Worker ${process.pid} pinned to CPU ${cpuIndex}`);
 } catch (err) {
@@ -86,7 +86,7 @@ async function processFips(fips) {
         return;
     }
 
-    // Attach density property to each tract using the last 6 characters of GEOID.
+    // Attach density properties to each tract using the last 6 characters of GEOID.
     tractGeojson.features.forEach(feature => {
         const geoid = feature.properties.GEOID;
         const tractKey = geoid.slice(-6);
@@ -142,22 +142,42 @@ async function processFips(fips) {
     const hexagons = h3.polygonToCells(polygon, resolution);
     console.log(`Computed ${hexagons.length} hexagons.`);
 
-    // === 4. Compute Density for Each Hexagon Sequentially ===
+    // === 4. Pre-filter Setup: Compute Hexagon Circumradius and Buffered Bounding Boxes for Tracts ===
+    // Use the hexagon's edge length as the circumradius (distance from center to vertex)
+    const hexEdgeLength = h3.edgeLength(resolution, 'm'); // in meters
+    const hexCircumradius = hexEdgeLength; // for a regular hexagon, this is a safe expansion distance
+
+    // For each tract, compute its bounding box and buffer it by the hexCircumradius.
+    const tractBuffers = tractGeojson.features.map(tract => {
+        const bbox = turf.bbox(tract); // [minX, minY, maxX, maxY]
+        const bboxPolygon = turf.bboxPolygon(bbox);
+        // Buffer the bounding box by the hexagon circumradius (in meters)
+        const bufferedBbox = turf.buffer(bboxPolygon, hexCircumradius, { units: 'meters' });
+        return { tract, bufferedBbox };
+    });
+
+    // === 5. Compute Density for Each Hexagon with Pre-filtering ===
     const hexData = {};
     hexagons.forEach(hex => {
+        // Convert the hexagon to a polygon and compute its centroid.
         let boundary = h3.cellToBoundary(hex, true);
-        if (boundary.length > 0) boundary.push(boundary[0]);
+        if (boundary.length > 0) boundary.push(boundary[0]); // close the polygon
         const hexPolygon = turf.polygon([boundary]);
+        const hexCentroid = turf.centroid(hexPolygon);
 
         let totalPopulation = 0;
         const hexAreaM2 = turf.area(hexPolygon);
         if (hexAreaM2 > 0) {
-            tractGeojson.features.forEach(tract => {
-                const intersection = turf.intersect(turf.featureCollection([hexPolygon, tract]));
-                if (intersection) {
-                    const intersectionArea = turf.area(intersection);
-                    const estimatedPopulation = (intersectionArea / 1e6) * tract.properties.DENSITY;
-                    totalPopulation += estimatedPopulation;
+            // For each tract, first check if the hex centroid is in the tract’s buffered bounding box.
+            tractBuffers.forEach(({ tract, bufferedBbox }) => {
+                if (turf.booleanPointInPolygon(hexCentroid, bufferedBbox)) {
+                    // Only perform the expensive intersection if the centroid is inside the buffered box.
+                    const intersection = turf.intersect(hexPolygon, tract);
+                    if (intersection) {
+                        const intersectionArea = turf.area(intersection);
+                        const estimatedPopulation = (intersectionArea / 1e6) * tract.properties.DENSITY;
+                        totalPopulation += estimatedPopulation;
+                    }
                 }
             });
         }
@@ -165,7 +185,7 @@ async function processFips(fips) {
         hexData[hex] = { hex, density };
     });
 
-    // === 5. Save Hexagon Density Data to a JSON File ===
+    // === 6. Save Hexagon Density Data to a JSON File ===
     if (!fs.existsSync(outputDir)) {
         fs.mkdirSync(outputDir, { recursive: true });
     }
