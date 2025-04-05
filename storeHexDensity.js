@@ -11,38 +11,38 @@ const totalCpus = os.cpus().length;
 let cpuIndex = 0;
 
 if (cluster.isMaster) {
-    console.log(`Master process ${process.pid} is running on ${totalCpus} cores`);
+  console.log(`Master process ${process.pid} running on ${totalCpus} cores`);
 
-    // Fork a worker for each missing state/resolution combination.
-    missingStates.forEach(fips => {
-        resolutions.forEach(resolution => {
-            cluster.fork({ FIPS: fips, RESOLUTION: resolution, CPU: cpuIndex });
-            cpuIndex = (cpuIndex + 1) % totalCpus;
-        });
+  // Fork a worker for each missing state/resolution combination.
+  missingStates.forEach(fips => {
+    resolutions.forEach(resolution => {
+      cluster.fork({ FIPS: fips, RESOLUTION: resolution, CPU: cpuIndex });
+      cpuIndex = (cpuIndex + 1) % totalCpus;
     });
+  });
 
-    cluster.on('exit', (worker, code, signal) => {
-        console.log(`Worker ${worker.process.pid} finished with code ${code}`);
-    });
+  cluster.on('exit', (worker, code, signal) => {
+    console.log(`Worker ${worker.process.pid} finished with code ${code}`);
+  });
 } else {
-    // Each worker handles one state (FIPS) at one resolution.
-    const processFips = require('./densityWorker.js');
-    const fips = process.env.FIPS;
-    console.log(
-        `Worker ${process.pid} processing FIPS: ${fips} at resolution ${process.env.RESOLUTION}`
-    );
-    processFips(fips)
-        .then(() => {
-            console.log(
-                `Worker ${process.pid} completed processing FIPS: ${fips} at resolution ${process.env.RESOLUTION}`
-            );
-            process.exit(0);
-        })
-        .catch(err => {
-            console.error(
-                `Error processing FIPS ${fips} in worker ${process.pid}:`,
-                err
-            );
-            process.exit(1);
-        });
+  // Each worker handles one state (FIPS) at one resolution.
+  const processFips = require('./densityWorker.js');
+  const fips = process.env.FIPS;
+  console.log(
+    `Worker ${process.pid} processing FIPS: ${fips} at resolution ${process.env.RESOLUTION}`
+  );
+  processFips(fips)
+    .then(() => {
+      console.log(
+        `Worker ${process.pid} completed processing FIPS: ${fips} at resolution ${process.env.RESOLUTION}`
+      );
+      process.exit(0);
+    })
+    .catch(err => {
+      console.error(
+        `Error processing FIPS ${fips} in worker ${process.pid}:`,
+        err
+      );
+      process.exit(1);
+    });
 }
