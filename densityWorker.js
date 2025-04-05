@@ -8,49 +8,74 @@ const shapefile = require('shapefile');
 const unzipper = require('unzipper');
 const h3 = require('h3-js');
 const turf = require('@turf/turf');
-const { execSync } = require('child_process');
+const { Worker } = require('worker_threads');
+// const { execSync } = require('child_process');
 
-// --- Pin this worker to a single CPU ---
-const cpuIndex = process.env.CPU ? parseInt(process.env.CPU) : 0;
-try {
-    // Bind the current process to the specified CPU.
-    execSync(`taskset -p -c ${cpuIndex} ${process.pid}`);
-    console.log(`Worker ${process.pid} pinned to CPU ${cpuIndex}`);
-} catch (err) {
-    console.error("Error pinning process to CPU", err);
+// === Logging Helpers ===
+function logInfo(message) {
+    console.log(`[INFO] ${new Date().toISOString()} - ${message}`);
 }
+
+function logError(message, error) {
+    if (error) {
+        console.error(`[ERROR] ${new Date().toISOString()} - ${message}`, error);
+    } else {
+        console.error(`[ERROR] ${new Date().toISOString()} - ${message}`);
+    }
+}
+
+// --- Optionally pin this worker to a single CPU ---
+// const cpuIndex = process.env.CPU ? parseInt(process.env.CPU) : 0;
+// try {
+//   execSync(`taskset -p -c ${cpuIndex} ${process.pid}`);
+//   logInfo(`Worker ${process.pid} pinned to CPU ${cpuIndex}`);
+// } catch (err) {
+//   logError("Error pinning process to CPU", err);
+// }
 
 // Use the RESOLUTION from environment (default to 7 if not provided)
 const resolution = process.env.RESOLUTION ? parseInt(process.env.RESOLUTION) : 7;
 
+// Utility: extract ZIP file to a temporary directory.
 async function extractZip(zipFilePath) {
+    logInfo(`Extracting ZIP file: ${zipFilePath}`);
     const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'shapefile-'));
     await fs.createReadStream(zipFilePath)
         .pipe(unzipper.Extract({ path: tempDir }))
         .promise();
+    logInfo(`Extracted to temporary directory: ${tempDir}`);
     return tempDir;
 }
 
 async function processFips(fips) {
+    logInfo(`\n=== Starting processing for FIPS: ${fips} at resolution ${resolution} ===`);
+
     // === Check if file has already been processed ===
     const outputDir = path.join(__dirname, 'density', `${fips}/${resolution}`);
     const outputFilePath = path.join(outputDir, `${fips}.json`);
     if (fs.existsSync(outputFilePath)) {
-        console.log(`Hexagon density data for FIPS ${fips} at resolution ${resolution} already exists at ${outputFilePath}. Skipping processing.`);
+        logInfo(`Hexagon density data for FIPS ${fips} at resolution ${resolution} already exists at ${outputFilePath}. Skipping processing.`);
         return;
     }
-
-    console.log(`\n=== Processing FIPS: ${fips} at resolution ${resolution} ===`);
 
     // === 1. Load Census Tract Population Data ===
-    console.log('Loading census CSV data...');
+    logInfo('Loading census CSV data...');
     const csvFilePath = `./census/density/${fips}.csv`;
     if (!fs.existsSync(csvFilePath)) {
-        console.error(`CSV file for FIPS ${fips} not found at ${csvFilePath}`);
+        logError(`CSV file for FIPS ${fips} not found at ${csvFilePath}`);
         return;
     }
-    const csvContent = fs.readFileSync(csvFilePath, 'utf8');
+    let csvContent;
+    try {
+        csvContent = fs.readFileSync(csvFilePath, 'utf8');
+        logInfo(`Successfully read CSV file for FIPS ${fips}`);
+    } catch (err) {
+        logError(`Error reading CSV file for FIPS ${fips} at ${csvFilePath}`, err);
+        return;
+    }
+
     const parsedCSV = Papa.parse(csvContent, { header: true });
+    logInfo(`Parsed CSV: ${parsedCSV.data.length} rows found.`);
     const tractData = {};
     parsedCSV.data.forEach(row => {
         const paddedTract = row.TRACT.toString().padStart(6, '0');
@@ -61,32 +86,42 @@ async function processFips(fips) {
             tractData[paddedTract] = { density, population, areaLand };
         }
     });
+    logInfo(`Loaded population and density data for ${Object.keys(tractData).length} census tracts.`);
 
     // === 2. Load Census Tract Shapefile ===
-    console.log('Extracting and loading census shapefile...');
+    logInfo('Extracting and loading census shapefile...');
     const zipFilePath = `./tracts/2020/tl_2020_${fips}_tract.zip`;
     if (!fs.existsSync(zipFilePath)) {
-        console.error(`Shapefile for FIPS ${fips} not found at ${zipFilePath}`);
+        logError(`Shapefile ZIP for FIPS ${fips} not found at ${zipFilePath}`);
         return;
     }
-    const tempDir = await extractZip(zipFilePath);
+    let tempDir;
+    try {
+        tempDir = await extractZip(zipFilePath);
+    } catch (err) {
+        logError(`Error extracting ZIP file for FIPS ${fips}`, err);
+        return;
+    }
     const shpFilePath = path.join(tempDir, `tl_2020_${fips}_tract.shp`);
     const dbfFilePath = path.join(tempDir, `tl_2020_${fips}_tract.dbf`);
 
     const tractGeojson = { type: "FeatureCollection", features: [] };
     try {
         const source = await shapefile.open(shpFilePath, dbfFilePath);
+        let featureCount = 0;
         while (true) {
             const result = await source.read();
             if (result.done) break;
             tractGeojson.features.push(result.value);
+            featureCount++;
         }
+        logInfo(`Shapefile read successfully: ${featureCount} features loaded.`);
     } catch (error) {
-        console.error('Error reading shapefile:', error);
+        logError('Error reading shapefile', error);
         return;
     }
 
-    // Attach density properties to each tract using the last 6 characters of GEOID.
+    // Attach density property to each tract using the last 6 characters of GEOID.
     tractGeojson.features.forEach(feature => {
         const geoid = feature.properties.GEOID;
         const tractKey = geoid.slice(-6);
@@ -96,16 +131,18 @@ async function processFips(fips) {
             feature.properties.AREALAND = tractData[tractKey].areaLand;
         }
     });
+    logInfo(`Attached density and population properties to shapefile features.`);
 
     // === 3. Define State Boundary and Compute Hexagons ===
-    console.log('Loading state boundary...');
+    logInfo('Loading state boundary GeoJSON...');
     const stateGeoJSONPath = path.join(__dirname, 'states', `${fips}.geojson`);
     let stateGeoJSON;
     try {
         const stateContent = fs.readFileSync(stateGeoJSONPath, 'utf8');
         stateGeoJSON = JSON.parse(stateContent);
+        logInfo(`State boundary GeoJSON loaded from ${stateGeoJSONPath}`);
     } catch (error) {
-        console.error('Error reading state boundary GeoJSON:', error);
+        logError('Error reading state boundary GeoJSON', error);
         return;
     }
 
@@ -117,7 +154,7 @@ async function processFips(fips) {
         } else if (feature.geometry.type === 'MultiPolygon') {
             stateBoundary = feature.geometry.coordinates[0][0]; // first polygon's outer ring
         } else {
-            console.error('Unsupported geometry type:', feature.geometry.type);
+            logError('Unsupported geometry type:', feature.geometry.type);
             return;
         }
     } else if (stateGeoJSON.type === 'Feature') {
@@ -126,71 +163,97 @@ async function processFips(fips) {
         } else if (stateGeoJSON.geometry.type === 'MultiPolygon') {
             stateBoundary = stateGeoJSON.geometry.coordinates[0][0];
         } else {
-            console.error('Unsupported geometry type:', stateGeoJSON.geometry.type);
+            logError('Unsupported geometry type:', stateGeoJSON.geometry.type);
             return;
         }
     } else {
-        console.error('Invalid GeoJSON format for state boundary.');
+        logError('Invalid GeoJSON format for state boundary.');
         return;
     }
+    logInfo(`State boundary extracted with ${stateBoundary.length} coordinates.`);
 
     // h3-js expects polygon coordinates in [lat, lng] order.
     const stateBoundaryLatLng = stateBoundary.map(coord => [coord[1], coord[0]]);
     const polygon = [stateBoundaryLatLng];
 
-    console.log(`Computing hexagons for state ${fips} at resolution ${resolution}...`);
+    logInfo(`Computing hexagons for state ${fips} at resolution ${resolution}...`);
     const hexagons = h3.polygonToCells(polygon, resolution);
-    console.log(`Computed ${hexagons.length} hexagons.`);
+    logInfo(`Computed ${hexagons.length} hexagons for state ${fips}.`);
 
-    // === 4. Pre-filter Setup: Compute Hexagon Circumradius and Buffered Bounding Boxes for Tracts ===
-    // Use the hexagon's edge length as the circumradius (distance from center to vertex)
-    const hexEdgeLength = h3.getHexagonEdgeLengthAvg(resolution, 'm'); // in meters
-    const hexCircumradius = hexEdgeLength; // for a regular hexagon, this is a safe expansion distance
+    // === 4. Compute Density for Each Hexagon Concurrently via Worker Threads ===
+    logInfo('Beginning concurrent hexagon density computation using worker threads...');
 
-    // For each tract, compute its bounding box and buffer it by the hexCircumradius.
-    const tractBuffers = tractGeojson.features.map(tract => {
-        const bbox = turf.bbox(tract); // [minX, minY, maxX, maxY]
-        const bboxPolygon = turf.bboxPolygon(bbox);
-        // Buffer the bounding box by the hexagon circumradius (in meters)
-        const bufferedBbox = turf.buffer(bboxPolygon, hexCircumradius, { units: 'meters' });
-        return { tract, bufferedBbox };
-    });
+    // Determine the number of worker threads for this process.
+    // (You can adjust this number based on your workload and available cores.)
+    const workerThreadCount = Math.max(os.cpus().length - 1, 1);
 
-    // === 5. Compute Density for Each Hexagon with Pre-filtering ===
-    const hexData = {};
-    hexagons.forEach(hex => {
-        // Convert the hexagon to a polygon and compute its centroid.
-        let boundary = h3.cellToBoundary(hex, true);
-        if (boundary.length > 0) boundary.push(boundary[0]); // close the polygon
-        const hexPolygon = turf.polygon([boundary]);
-        const hexCentroid = turf.centroid(hexPolygon);
+    // Split the hexagon array into roughly equal chunks.
+    function chunkArray(array, chunks) {
+        const chunkSize = Math.ceil(array.length / chunks);
+        const result = [];
+        for (let i = 0; i < array.length; i += chunkSize) {
+            result.push(array.slice(i, i + chunkSize));
+        }
+        return result;
+    }
 
-        let totalPopulation = 0;
-        const hexAreaM2 = turf.area(hexPolygon);
-        if (hexAreaM2 > 0) {
-            // For each tract, first check if the hex centroid is in the tract’s buffered bounding box.
-            tractBuffers.forEach(({ tract, bufferedBbox }) => {
-                if (turf.booleanPointInPolygon(hexCentroid, bufferedBbox)) {
-                    // Only perform the expensive intersection if the centroid is inside the buffered box.
-                    const intersection = turf.intersect(turf.featureCollection([hexPolygon, tract]));
-                    if (intersection) {
-                        const intersectionArea = turf.area(intersection);
-                        const estimatedPopulation = (intersectionArea / 1e6) * tract.properties.DENSITY;
-                        totalPopulation += estimatedPopulation;
-                    }
+    const hexChunks = chunkArray(hexagons, workerThreadCount);
+
+    // Spawn a worker thread for each chunk.
+    const workerPromises = hexChunks.map(chunk => {
+        return new Promise((resolve, reject) => {
+            const worker = new Worker(path.join(__dirname, 'hexWorker.js'), {
+                workerData: {
+                    hexagons: chunk,
+                    tractGeojson: tractGeojson
                 }
             });
-        }
-        const density = totalPopulation / (hexAreaM2 / 1e6);
-        hexData[hex] = { hex, density };
+            worker.on('message', result => {
+                // If an error is returned from the worker, reject.
+                if (result && result.error) {
+                    reject(new Error(result.error));
+                } else {
+                    resolve(result);
+                }
+            });
+            worker.on('error', reject);
+            worker.on('exit', code => {
+                if (code !== 0) {
+                    reject(new Error(`Worker stopped with exit code ${code}`));
+                }
+            });
+        });
     });
 
-    // === 6. Save Hexagon Density Data to a JSON File ===
-    if (!fs.existsSync(outputDir)) {
-        fs.mkdirSync(outputDir, { recursive: true });
+    let hexResults;
+    try {
+        const resultsArray = await Promise.all(workerPromises);
+        // Flatten the results (each worker returns an array of results).
+        hexResults = resultsArray.flat();
+    } catch (err) {
+        logError('Error during concurrent hexagon density computation', err);
+        return;
     }
-    fs.writeFileSync(outputFilePath, JSON.stringify(hexData, null, 2));
-    console.log(`Successfully stored hexagon density data for ${fips} at resolution ${resolution} to ${outputFilePath}`);
+
+    // Organize results into an object keyed by hex.
+    const hexData = {};
+    hexResults.forEach(result => {
+        hexData[result.hex] = result;
+    });
+
+    logInfo('Completed concurrent hexagon density computation.');
+
+    // === 5. Save Hexagon Density Data to a JSON File ===
+    try {
+        if (!fs.existsSync(outputDir)) {
+            fs.mkdirSync(outputDir, { recursive: true });
+            logInfo(`Created output directory: ${outputDir}`);
+        }
+        fs.writeFileSync(outputFilePath, JSON.stringify(hexData, null, 2));
+        logInfo(`Successfully stored hexagon density data for ${fips} at resolution ${resolution} to ${outputFilePath}`);
+    } catch (err) {
+        logError('Error saving hexagon density data to file', err);
+    }
 }
 
 module.exports = processFips;
