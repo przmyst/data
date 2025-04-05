@@ -180,38 +180,50 @@ async function processFips(fips) {
   // === 4. Compute Density for Each Hexagon Concurrently via Clustered Child Processes ===
   logInfo('Beginning concurrent hexagon density computation using child processes...');
 
-  // Write the heavy tractGeojson to a temporary file so that sub-processes can load it without receiving it over IPC.
+  // Write the heavy tractGeojson to a temporary file so that sub-processes can load it.
   const tractTempFile = path.join(os.tmpdir(), `tractGeojson_${fips}_${Date.now()}.json`);
   fs.writeFileSync(tractTempFile, JSON.stringify(tractGeojson));
   logInfo(`Wrote tract GeoJSON to temporary file: ${tractTempFile}`);
 
-  // Determine number of sub-processes (e.g. one per available CPU minus one).
+  // Determine the number of sub-processes (e.g. one per available CPU minus one).
   const subProcessCount = Math.max(os.cpus().length - 1, 1);
   const hexChunks = chunkArray(hexagons, subProcessCount);
 
-  // For each chunk, fork a new process running hexClusterWorker.js.
-  const childPromises = hexChunks.map(chunk => {
+  // For each chunk, write it to a temporary file and fork a new process running hexClusterWorker.js.
+  const childPromises = hexChunks.map((chunk, idx) => {
+    // Write the hex chunk to a temporary file.
+    const hexChunkFile = path.join(os.tmpdir(), `hexChunk_${fips}_${idx}_${Date.now()}.json`);
+    fs.writeFileSync(hexChunkFile, JSON.stringify(chunk));
+
     return new Promise((resolve, reject) => {
       const child = fork(path.join(__dirname, 'hexClusterWorker.js'), [], {
         env: {
-          // Pass the hexagon chunk as a JSON string.
-          HEX_CHUNK: JSON.stringify(chunk),
-          // Pass the temporary file path for the tractGeojson.
+          HEX_CHUNK_FILE: hexChunkFile,
           TRACT_FILE: tractTempFile
         },
         stdio: ['inherit', 'inherit', 'inherit', 'ipc']
       });
 
       child.on('message', (result) => {
+        // Remove the temporary hex chunk file when done.
+        fs.unlink(hexChunkFile, (err) => {
+          if (err) {
+            console.error(`Error removing temporary hex chunk file: ${hexChunkFile}`, err);
+          }
+        });
         if (result && result.error) {
           reject(new Error(result.error));
         } else {
           resolve(result);
         }
       });
-      child.on('error', reject);
+      child.on('error', (err) => {
+        fs.unlink(hexChunkFile, () => {});
+        reject(err);
+      });
       child.on('exit', code => {
         if (code !== 0) {
+          fs.unlink(hexChunkFile, () => {});
           reject(new Error(`Child process exited with code ${code}`));
         }
       });
