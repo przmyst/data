@@ -1,6 +1,5 @@
 // hexClusterWorker.js
 const fs = require('fs');
-const path = require('path');
 const h3 = require('h3-js');
 const turf = require('@turf/turf');
 
@@ -26,23 +25,23 @@ function computeHexDensity(hex, tractGeojson) {
 }
 
 function processChunk() {
-  // Read the hexagon chunk from the environment.
+  // Read the hexagon chunk from the temporary file.
   let hexChunk;
   try {
-    hexChunk = JSON.parse(process.env.HEX_CHUNK);
+    const hexChunkContent = fs.readFileSync(process.env.HEX_CHUNK_FILE, 'utf8');
+    hexChunk = JSON.parse(hexChunkContent);
   } catch (err) {
-    process.send({ error: `Failed to parse HEX_CHUNK: ${err}` });
+    process.send({ error: `Failed to read HEX_CHUNK_FILE: ${err}` });
     process.exit(1);
   }
 
   // Load the tractGeojson from the temporary file.
-  const tractFile = process.env.TRACT_FILE;
   let tractGeojson;
   try {
-    const fileContent = fs.readFileSync(tractFile, 'utf8');
+    const fileContent = fs.readFileSync(process.env.TRACT_FILE, 'utf8');
     tractGeojson = JSON.parse(fileContent);
   } catch (err) {
-    process.send({ error: `Failed to load tractGeojson from ${tractFile}: ${err}` });
+    process.send({ error: `Failed to load tractGeojson from ${process.env.TRACT_FILE}: ${err}` });
     process.exit(1);
   }
 
